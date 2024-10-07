@@ -1,0 +1,117 @@
+- name: Initial configurations
+  hosts: all
+  vars_files:
+  - vars.yml
+  tasks:
+
+  - name: Ensure .ssh directory exists
+    ansible.builtin.file:
+      path: "/home/{{ host_user }}/.ssh"
+      state: directory
+      owner: "{{ host_user }}"
+      group: "{{ host_user }}"
+      mode: 0700 
+
+  - name: Add authorized_keys file
+    ansible.builtin.copy:
+      src: "authorized_keys"
+      dest: "/home/{{ host_user }}/.ssh"
+      owner: "{{ host_user }}"
+      group: "{{ host_user }}"
+      mode: 0600
+   
+  - name: Disable password when sudo
+    ansible.builtin.lineinfile:
+      path: /etc/sudoers.d/{{ host_user }}
+      state: present
+      create: true
+      line: "{{ host_user }} ALL=(ALL) NOPASSWD: ALL"
+      owner: root
+      group: root
+      mode: 0644
+
+- name: Disable swap on all nodes
+  hosts: all
+  tasks:
+
+    - name: disable swap
+      ansible.builtin.shell: sudo swapoff -a
+
+    - name: disable swap regardless of restart
+      ansible.builtin.lineinfile:
+        backup: yes
+        path: /etc/fstab
+        state: present
+        regexp: '^(/swap.img.*)$'
+        line: '# \1'
+        backrefs: yes
+
+    - name: remove /swap.img file if present
+      ansible.builtin.file:
+        path: /swap.img
+        state: absent     
+
+- name: Set hostname for all nodes
+  hosts: all
+  tasks:
+    - ansible.builtin.shell: sudo hostnamectl set-hostname {{ hostname }}
+
+- name: Install necessary k8s tools on all nodes
+  hosts: all
+  tasks:
+    - name: Install kubelet, kubeadm and kubectl
+      ansible.builtin.script: ./scripts/install-kube-tools.sh
+
+    - name: Configure for forwarding IPv4 and letting iptables see bridged traffic
+      ansible.builtin.script: ./scripts/configure-network.sh
+
+    - name: Install Containerd as container runtime
+      ansible.builtin.script: ./scripts/install-cotainerd.sh
+
+    - name: Configure Containerd to use systemd as cgroup driver
+      ansible.builtin.lineinfile:
+        backup: yes
+        path: /etc/containerd/config.toml
+        state: present
+        regexp: '^(.*)SystemdCgroup(.*)$'
+        line: '\1SystemdCgroup = true'
+        backrefs: yes
+      notify:
+        - Restart containerd
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+
+- name: Pause for 30 seconds for k8s tools to be ready
+  hosts: all
+  tasks:
+    - ansible.builtin.pause:
+        seconds: 30
+
+- name: Configure master node
+  hosts: master
+  tasks:
+    - name: Initialize master node
+      ansible.builtin.shell: sudo kubeadm init --pod-network-cidr=192.168.0.0/16
+      notify: Get join command
+
+    - name: Pause for 30 seconds for master node to be ready
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Install Calico as pod network add-on
+      ansible.builtin.script: ./scripts/install-calico.sh
+
+  handlers:
+    - name: Get join command
+      ansible.builtin.shell: sudo kubeadm token create --print-join-command
+      register: join_command
+
+- name: Join worker nodes to the cluster
+  hosts: worker
+  tasks:
+    - name: Join worker nodes to the cluster
+      ansible.builtin.shell: "{{ hostvars[groups['master'].0]['join_command']['stdout'] }}"
